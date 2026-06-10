@@ -115,6 +115,23 @@ impl MasterRef {
         self.mux_forward("cancel", lport, rport)
     }
 
+    /// Cancel several forwards with one mux request — much faster than one
+    /// round-trip each when tearing down a whole server.
+    pub fn cancel_many(&self, fwds: &[(u16, u16)]) -> Result<(), String> {
+        let mut c = self.base();
+        c.arg("-O").arg("cancel");
+        for (lp, rp) in fwds {
+            c.arg("-L").arg(format!("127.0.0.1:{lp}:localhost:{rp}"));
+        }
+        c.arg(&self.dest);
+        let out = output_timeout(c, Duration::from_secs(10), None)?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(first_line(&out.stderr))
+        }
+    }
+
     fn mux_forward(&self, op: &str, lport: u16, rport: u16) -> Result<(), String> {
         let mut c = self.base();
         c.arg("-O")

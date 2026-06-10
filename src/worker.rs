@@ -25,7 +25,15 @@ enum WMsg {
     MasterDone { key: String, result: Result<Master, String> },
     ScanDone { key: String, result: Result<Vec<RemoteApp>, String> },
     FwdDone { key: String, rport: u16, lport: u16, pin: bool, result: Result<(), String> },
+    /// A cancel failed and the local port is still bound — the forward is
+    /// in fact still running; the UI must not pretend otherwise.
+    CancelFailed { key: String, rport: u16, lport: u16, err: String },
 }
+
+/// How long a just-cancelled local port is excluded from being adopted as
+/// an "external" (user-owned) forward — covers the window where the listener
+/// is still bound while the cancel is in flight.
+const CANCEL_COOLDOWN: Duration = Duration::from_secs(15);
 
 enum MState {
     Connecting,
@@ -127,6 +135,7 @@ pub fn run(cmd_rx: Receiver<Cmd>, ev_tx: Sender<Ev>, opts: Options) {
         ev_tx,
         wtx,
         resolve_cache: HashMap::new(),
+        cooldown: HashMap::new(),
     };
     let _ = w.ev_tx.send(Ev::AutoMode(w.auto));
 
@@ -151,6 +160,8 @@ struct Worker {
     wtx: Sender<WMsg>,
     /// (dest, extra) -> resolved identity, so we don't fork `ssh -G` each tick.
     resolve_cache: HashMap<(String, Vec<String>), Option<discover::Resolved>>,
+    /// Local ports with a cancel in flight (see CANCEL_COOLDOWN).
+    cooldown: HashMap<u16, Instant>,
 }
 
 impl Worker {
@@ -161,6 +172,17 @@ impl Worker {
             WMsg::ScanDone { key, result } => self.on_scan(key, result),
             WMsg::FwdDone { key, rport, lport, pin, result } => {
                 self.on_fwd(key, rport, lport, pin, result)
+            }
+            WMsg::CancelFailed { key, rport, lport, err } => {
+                self.toast(format!(
+                    "couldn't stop forward 127.0.0.1:{lport} → :{rport}: {err} — still active"
+                ));
+                if let Some(app) = self.app_mut(&key, rport) {
+                    // Stay truthful: the tunnel is still up.
+                    if app.status == FwdView::Off && app.lport == Some(lport) {
+                        app.status = FwdView::Active;
+                    }
+                }
             }
             WMsg::Cmd(cmd) => self.on_cmd(cmd),
         }
@@ -182,11 +204,20 @@ impl Worker {
             Cmd::ToggleAuto => {
                 self.auto = !self.auto;
                 let _ = self.ev_tx.send(Ev::AutoMode(self.auto));
+                let keys: Vec<String> = self.hosts.keys().cloned().collect();
                 if self.auto {
-                    let keys: Vec<String> = self.hosts.keys().cloned().collect();
                     for k in keys {
                         self.auto_forward_pass(&k);
                     }
+                    self.toast("forwarding ON — re-establishing".into());
+                } else {
+                    // OFF means off: drop every forward we own, everywhere.
+                    for k in keys {
+                        self.cancel_host_forwards(&k);
+                    }
+                    self.toast(
+                        "forwarding OFF — all forwards cancelled (f/e still work manually)".into(),
+                    );
                 }
             }
             Cmd::Quit => {}
@@ -196,6 +227,7 @@ impl Worker {
     // ---- tick: watch local ssh connections ----
 
     fn on_tick(&mut self) {
+        self.cooldown.retain(|_, t| t.elapsed() < CANCEL_COOLDOWN);
         let conns = discover::discover();
         for h in self.hosts.values_mut() {
             h.present = false;
@@ -398,11 +430,21 @@ impl Worker {
         // something that isn't us; the rest fall through to auto-forwarding
         // on a free port.
         let used = self.used_lports();
+        let cooling: Vec<u16> = self
+            .cooldown
+            .iter()
+            .filter(|(_, t)| t.elapsed() < CANCEL_COOLDOWN)
+            .map(|(p, _)| *p)
+            .collect();
         let Some(host) = self.hosts.get_mut(&key) else { return };
         let ext_valid: BTreeMap<u16, u16> = host
             .ext_forwards
             .iter()
-            .filter(|&(_, &lp)| !used.contains(&lp) && !ports::is_free(lp))
+            // A port we just cancelled may still be bound for a moment —
+            // don't mistake our dying listener for the user's forward.
+            .filter(|&(_, &lp)| {
+                !used.contains(&lp) && !cooling.contains(&lp) && !ports::is_free(lp)
+            })
             .map(|(&rp, &lp)| (rp, lp))
             .collect();
 
@@ -483,24 +525,84 @@ impl Worker {
 
         // Apps that vanished from the remote: cancel their forwards.
         let gone: Vec<u16> = host.apps.keys().filter(|p| !seen.contains(p)).cloned().collect();
+        let mref = match &host.master {
+            MState::Ready(m) => Some(m.r.clone()),
+            _ => None,
+        };
+        let mut gone_cancels: Vec<(u16, u16)> = Vec::new();
         for rport in gone {
             if let Some(app) = host.apps.remove(&rport) {
                 if let (FwdView::Active | FwdView::Pending, Some(lport)) = (&app.status, app.lport)
                 {
-                    if let MState::Ready(m) = &host.master {
-                        let mref = m.r.clone();
-                        std::thread::spawn(move || {
-                            let _ = mref.cancel(lport, rport);
-                        });
-                    }
+                    gone_cancels.push((lport, rport));
                 }
             }
+        }
+        if let Some(m) = mref {
+            self.spawn_cancels(m, &key, gone_cancels);
         }
 
         self.auto_forward_pass(&key);
     }
 
     // ---- forwarding ----
+
+    /// Cancel forwards in the background: one batched mux request, falling
+    /// back to individual cancels with a retry. If a cancel really failed and
+    /// the port is still bound, report it so the UI stays truthful.
+    fn spawn_cancels(&mut self, mref: crate::control::MasterRef, key: &str, cancels: Vec<(u16, u16)>) {
+        if cancels.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        for (lp, _) in &cancels {
+            self.cooldown.insert(*lp, now);
+        }
+        let wtx = self.wtx.clone();
+        let key = key.to_string();
+        std::thread::spawn(move || {
+            if mref.cancel_many(&cancels).is_ok() {
+                return;
+            }
+            for (lp, rp) in cancels {
+                let mut res = mref.cancel(lp, rp);
+                if res.is_err() {
+                    res = mref.cancel(lp, rp);
+                }
+                if let Err(err) = res {
+                    if !ports::is_free(lp) {
+                        let _ = wtx.send(WMsg::CancelFailed {
+                            key: key.clone(),
+                            rport: rp,
+                            lport: lp,
+                            err,
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    /// Cancel every active/pending forward of one host (F / p turning off).
+    fn cancel_host_forwards(&mut self, key: &str) {
+        let Some(host) = self.hosts.get_mut(key) else { return };
+        let mref = match &host.master {
+            MState::Ready(m) => Some(m.r.clone()),
+            _ => None,
+        };
+        let mut cancels: Vec<(u16, u16)> = Vec::new();
+        for app in host.apps.values_mut() {
+            if matches!(app.status, FwdView::Active | FwdView::Pending) {
+                if let Some(lp) = app.lport {
+                    cancels.push((lp, app.rport));
+                }
+                app.status = FwdView::Off;
+            }
+        }
+        if let Some(m) = mref {
+            self.spawn_cancels(m, key, cancels);
+        }
+    }
 
     /// Local ports claimed by our own active/pending forwards (any host).
     fn used_lports(&self) -> Vec<u16> {
@@ -569,41 +671,28 @@ impl Worker {
             .app_mut(&key, rport)
             .and_then(|a| a.process.clone());
         let Some(host) = self.hosts.get_mut(&key) else { return };
-        let paused = host.paused;
         let mref = match &host.master {
             MState::Ready(m) => Some(m.r.clone()),
             _ => None,
         };
-        let stray_cancel = |lp: u16| {
-            if let Some(m) = mref.clone() {
-                std::thread::spawn(move || {
-                    let _ = m.cancel(lp, rport);
-                });
-            }
+        // The result only applies if this exact forward is still awaited:
+        // any off-switch (p/F/f/h) or reassignment in the meantime moved the
+        // app out of Pending, and a successful stray must be undone.
+        let stale = match host.apps.get(&rport) {
+            None => true, // app vanished while the forward was in flight
+            Some(app) => app.lport != Some(lport) || app.status != FwdView::Pending,
         };
-        let Some(app) = host.apps.get_mut(&rport) else {
-            // App vanished while the forward was in flight.
+        if stale {
             if result.is_ok() {
-                stray_cancel(lport);
-            }
-            return;
-        };
-        if app.lport != Some(lport) {
-            // A newer assignment superseded this one.
-            if result.is_ok() {
-                stray_cancel(lport);
+                if let Some(m) = mref {
+                    self.spawn_cancels(m, &key, vec![(lport, rport)]);
+                }
             }
             return;
         }
+        let Some(app) = host.apps.get_mut(&rport) else { return };
         match result {
             Ok(()) => {
-                if paused || app.muted || app.tier() != Tier::App {
-                    // The user paused/muted/hid this while the forward was in
-                    // flight — undo it.
-                    stray_cancel(lport);
-                    app.status = FwdView::Off;
-                    return;
-                }
                 app.status = FwdView::Active;
                 app.retried_new_port = false;
                 app.pinned = pin;
@@ -693,6 +782,9 @@ impl Worker {
             app.override_app = Some(true);
             self.state.entry(&key, rport).tier = Some("app".into());
         }
+        if let Some(old) = old {
+            self.cooldown.insert(old, Instant::now());
+        }
         let wtx = self.wtx.clone();
         std::thread::spawn(move || {
             if let Some(old) = old {
@@ -720,13 +812,12 @@ impl Worker {
             FwdView::Active | FwdView::Pending => {
                 app.muted = true;
                 app.status = FwdView::Off;
-                if let Some(lport) = app.lport {
-                    std::thread::spawn(move || {
-                        let _ = mref.cancel(lport, rport);
-                    });
-                }
+                let cancel = app.lport.map(|lp| (lp, rport));
                 self.state.entry(&key, rport).muted = true;
                 self.state.save();
+                if let Some(c) = cancel {
+                    self.spawn_cancels(mref, &key, vec![c]);
+                }
             }
             FwdView::Off | FwdView::Error(_) => {
                 app.muted = false;
@@ -763,16 +854,17 @@ impl Worker {
         if app.tier() == Tier::App {
             // demote: cancel our forward, hide from the default view
             app.override_app = Some(false);
-            if matches!(app.status, FwdView::Active | FwdView::Pending) {
-                if let (Some(m), Some(lp)) = (mref, app.lport) {
-                    std::thread::spawn(move || {
-                        let _ = m.cancel(lp, rport);
-                    });
-                }
-            }
+            let cancel = if matches!(app.status, FwdView::Active | FwdView::Pending) {
+                app.lport.map(|lp| (lp, rport))
+            } else {
+                None
+            };
             app.status = FwdView::Off;
             self.state.entry(&key, rport).tier = Some("bg".into());
             self.state.save();
+            if let (Some(m), Some(c)) = (mref, cancel) {
+                self.spawn_cancels(m, &key, vec![c]);
+            }
             self.toast(format!("{label}:{rport} hidden — not forwarded (press a, then h to restore)"));
         } else {
             // promote: show it and let auto-forward pick it up
@@ -806,27 +898,8 @@ impl Worker {
         let Some(host) = self.hosts.get_mut(&key) else { return };
         host.paused = !host.paused;
         let paused = host.paused;
-        let mref = match &host.master {
-            MState::Ready(m) => Some(m.r.clone()),
-            _ => None,
-        };
         if paused {
-            let mut cancels: Vec<(u16, u16)> = Vec::new();
-            for app in host.apps.values_mut() {
-                if matches!(app.status, FwdView::Active | FwdView::Pending) {
-                    if let Some(lp) = app.lport {
-                        cancels.push((lp, app.rport));
-                    }
-                    app.status = FwdView::Off;
-                }
-            }
-            if let (Some(m), false) = (mref, cancels.is_empty()) {
-                std::thread::spawn(move || {
-                    for (lp, rp) in cancels {
-                        let _ = m.cancel(lp, rp);
-                    }
-                });
-            }
+            self.cancel_host_forwards(&key);
         }
         self.state.set_paused(&key, paused);
         let title = self.hosts.get(&key).map(|h| h.title.clone()).unwrap_or(key.clone());

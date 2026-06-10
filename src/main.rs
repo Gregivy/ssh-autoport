@@ -52,12 +52,18 @@ OPTIONS:
 
 KEYS (in the TUI):
     Up/Down    select app          Enter/e   assign a local port (pins it)
-    f          forward on/off      F         whole-server forwarding on/off
+    f          forwarding on/off for the app
+    F          forwarding on/off for the whole server (persisted)
+    p          forwarding on/off globally
     h          hide/unhide a port (overrides the heuristic, persisted)
     c          attach a note       o         open http://127.0.0.1:<port>/
     a          show all ports (background + system)
-    p          pause/resume auto-forward     r   rescan now
-    q          quit (tears down our forwards)
+    r          rescan now          q         quit (tears down our forwards)
+
+f/F/p are the same switch at three scopes: turning one OFF cancels the
+forwards in that scope immediately and stops auto-forwarding there;
+turning it back ON re-establishes them. Manual forwards (f/e on a row)
+work even while a wider scope is off.
 
 Ephemeral-range listeners (>= 32768) and clusters of same-named loopback
 ports (e.g. Jupyter kernels) are classified as background: hidden and not

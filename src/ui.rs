@@ -268,7 +268,11 @@ impl Ui {
         .areas(f.area());
 
         // Header
-        let auto = if self.auto { "auto-forward ON".green() } else { "auto-forward OFF".red() };
+        let auto = if self.auto {
+            "forwarding ON".green()
+        } else {
+            "forwarding OFF (p to enable, f/e for one-off)".red()
+        };
         let header = Line::from(vec![
             " ssh-autoport ".bold().reversed(),
             "  ".into(),
@@ -322,7 +326,7 @@ impl Ui {
         }
 
         // Help
-        let help_text = " ↑↓ · ⏎/e port · f fwd · F server · h hide/show port · c note · o open · a all ports · p auto · r rescan · q quit";
+        let help_text = " ↑↓ · ⏎/e port · f app on/off · F server on/off · p all on/off · h hide · c note · o open · a all ports · r rescan · q quit";
         f.render_widget(Paragraph::new(Line::from(help_text.dim())), help);
     }
 

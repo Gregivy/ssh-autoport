@@ -81,15 +81,23 @@ ssh-autoport        # in another
 | --- | --- |
 | `↑` `↓` / `j` `k` | select an app |
 | `Enter` / `e` | type a local port for the app — checks availability, pins it |
-| `f` | toggle forwarding for the selected app (remembered) |
-| `F` | toggle forwarding for the whole server (remembered) |
+| `f` | forwarding on/off for the selected app (remembered) |
+| `F` | forwarding on/off for the whole server (remembered) |
+| `p` | forwarding on/off globally |
 | `h` | hide a port (stop forwarding, drop from view) or promote a hidden one (remembered) |
 | `c` | attach a note to the app — shown in the table, remembered |
 | `o` | open `http://127.0.0.1:<port>/` in your browser |
 | `a` | show all ports, including background and system ones |
-| `p` | pause/resume auto-forwarding |
 | `r` | rescan now |
 | `q` | quit — cancels our forwards, closes our masters |
+
+`f`/`F`/`p` are one switch at three scopes (app / server / global). Turning a
+scope **off cancels its forwards immediately** and stops auto-forwarding
+there; turning it back on re-establishes them on their remembered ports.
+Manual forwards (`f`/`e` on a row) work even while a wider scope is off —
+that's also how `--no-auto` mode operates. Cancellations are verified: if a
+forward genuinely can't be stopped, its row flips back to `forwarded` with an
+error toast rather than pretending it's gone.
 
 The detail panel under the table shows the selected app's pid and full
 command line (fetched from `/proc/<pid>/cmdline`, so twenty `python`
