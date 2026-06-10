@@ -46,24 +46,30 @@ USAGE:
 OPTIONS:
     -i, --interval <SECS>   Remote rescan interval (default: 3)
         --no-auto           Don't auto-forward; assign ports manually in the TUI
-        --show-system       Show system services (sshd, dns, ...) from the start
+        --show-all          Show background/system ports from the start
     -V, --version           Print version
     -h, --help              Show this help
 
 KEYS (in the TUI):
     Up/Down    select app          Enter/e   assign a local port (pins it)
     f          forward on/off      F         whole-server forwarding on/off
+    h          hide/unhide a port (overrides the heuristic, persisted)
     c          attach a note       o         open http://127.0.0.1:<port>/
-    a          show/hide system ports        p   pause/resume auto-forward
-    r          rescan now          q         quit (tears down our forwards)
+    a          show all ports (background + system)
+    p          pause/resume auto-forward     r   rescan now
+    q          quit (tears down our forwards)
 
-Port assignments, on/off states, notes and server pauses are remembered
-per server+app in ~/.config/ssh-autoport/state.json.";
+Ephemeral-range listeners (>= 32768) and clusters of same-named loopback
+ports (e.g. Jupyter kernels) are classified as background: hidden and not
+auto-forwarded. Press a to see them, h to promote one permanently.
+
+Port assignments, on/off states, hides, notes and server pauses are
+remembered per server+app in ~/.config/ssh-autoport/state.json.";
 
 fn main() {
     let mut interval = Duration::from_secs(3);
     let mut auto = true;
-    let mut show_system = false;
+    let mut show_hidden = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -76,7 +82,7 @@ fn main() {
                 }
             }
             "--no-auto" => auto = false,
-            "--show-system" => show_system = true,
+            "--show-system" | "--show-all" => show_hidden = true,
             "-V" | "--version" => {
                 println!("ssh-autoport {}", env!("CARGO_PKG_VERSION"));
                 return;
@@ -95,7 +101,7 @@ fn main() {
     std::thread::spawn(move || worker::run(cmd_rx, ev_tx, worker::Options { interval, auto }));
 
     let mut terminal = ratatui::init();
-    let mut ui = Ui::new(show_system);
+    let mut ui = Ui::new(show_hidden);
 
     loop {
         if SHOULD_QUIT.load(Ordering::SeqCst) {

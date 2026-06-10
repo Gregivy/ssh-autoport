@@ -8,6 +8,8 @@
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use crate::types::Tier;
+
 /// A TCP listener found on the remote host.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RemoteApp {
@@ -267,6 +269,49 @@ pub fn is_system(app: &RemoteApp, sshd_port: u16) -> bool {
     false
 }
 
+/// Start of the default Linux ephemeral port range: listeners up here almost
+/// always picked their port at runtime (Jupyter kernels, RPC workers, IDE
+/// helpers) rather than being something a human wants to open in a browser.
+pub const EPHEMERAL_START: u16 = 32768;
+
+/// At this many same-named loopback listeners below the ephemeral range
+/// (e.g. a configured Jupyter kernel port range 9000-9019), the whole group
+/// is considered background noise.
+pub const CLUSTER_MIN: usize = 5;
+
+/// Ports people deliberately run dev servers on — never demoted to Bg by
+/// the heuristics, whatever the cluster size.
+const COMMON_DEV_PORTS: &[u16] = &[
+    80, 443, 3000, 3001, 3002, 3003, 4000, 4200, 4321, 5000, 5001, 5173, 5174, 6006, 7860, 7861,
+    8000, 8001, 8080, 8081, 8501, 8765, 8787, 8888, 8889,
+];
+
+/// Classify a scanned port. `lo_name_counts` is how many loopback-bound
+/// listeners each process name has on this host (for cluster detection).
+pub fn classify(
+    app: &RemoteApp,
+    sshd_port: u16,
+    lo_name_counts: &BTreeMap<String, usize>,
+) -> Tier {
+    if is_system(app, sshd_port) {
+        return Tier::System;
+    }
+    if COMMON_DEV_PORTS.contains(&app.port) {
+        return Tier::App;
+    }
+    if app.port >= EPHEMERAL_START {
+        return Tier::Bg;
+    }
+    if app.addr == "lo" {
+        if let Some(p) = &app.process {
+            if lo_name_counts.get(p).copied().unwrap_or(0) >= CLUSTER_MIN {
+                return Tier::Bg;
+            }
+        }
+    }
+    Tier::App
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +375,38 @@ mod tests {
         let apps = parse_scan(out);
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].process.as_deref(), Some("gunicorn"));
+    }
+
+    #[test]
+    fn classify_tiers() {
+        let mk = |port: u16, addr: &str, proc_: &str| RemoteApp {
+            port,
+            addr: addr.into(),
+            process: if proc_.is_empty() { None } else { Some(proc_.into()) },
+            ..Default::default()
+        };
+        let none = BTreeMap::new();
+        // ephemeral-range listener -> background
+        assert_eq!(classify(&mk(45523, "lo", "python"), 22, &none), Tier::Bg);
+        assert_eq!(classify(&mk(40653, "lo", "code-89de5a8d4d"), 22, &none), Tier::Bg);
+        // deliberate low port -> app
+        assert_eq!(classify(&mk(3000, "lo", "llama-server"), 22, &none), Tier::App);
+        assert_eq!(classify(&mk(29500, "*", "pt_elastic"), 22, &none), Tier::App);
+        // a configured kernel range: 20 loopback "python" listeners -> bg
+        let cluster: BTreeMap<String, usize> = [("python".to_string(), 20usize)].into();
+        assert_eq!(classify(&mk(9000, "lo", "python"), 22, &cluster), Tier::Bg);
+        // ...but a wildcard-bound one with the same name stays an app
+        assert_eq!(classify(&mk(9100, "*", "python"), 22, &cluster), Tier::App);
+        // ...and well-known dev ports are protected from the cluster rule
+        let pycluster: BTreeMap<String, usize> = [("python".to_string(), 6usize)].into();
+        assert_eq!(classify(&mk(8000, "lo", "python"), 22, &pycluster), Tier::App);
+        // small same-name groups are fine
+        let few: BTreeMap<String, usize> = [("python".to_string(), 3usize)].into();
+        assert_eq!(classify(&mk(5050, "lo", "python"), 22, &few), Tier::App);
+        // system stays system
+        assert_eq!(classify(&mk(22, "*", "sshd"), 22, &none), Tier::System);
+        // jupyter on 8888 with unknown process -> app
+        assert_eq!(classify(&mk(8888, "*", ""), 2222, &none), Tier::App);
     }
 
     #[test]

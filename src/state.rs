@@ -24,6 +24,10 @@ pub struct Assignment {
     /// Free-text note attached by the user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+    /// User override of the visibility heuristic: "app" (always show and
+    /// auto-forward) or "bg" (hide, never auto-forward).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
     #[serde(default)]
     pub updated_at: u64,
 }

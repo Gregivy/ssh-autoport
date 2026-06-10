@@ -9,9 +9,17 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::types::{AppView, Cmd, Ev, FwdView, HostView, MasterView};
+use crate::types::{AppView, Cmd, Ev, FwdView, HostView, MasterView, Tier};
 
 const TOAST_TTL: Duration = Duration::from_secs(6);
+
+/// A row is shown by default when it's a real app or something is actively
+/// forwarded on it; bg/system rows appear only in the `a` (show-all) view.
+fn row_visible(a: &AppView, show_hidden: bool) -> bool {
+    show_hidden
+        || a.tier == Tier::App
+        || matches!(a.status, FwdView::Active | FwdView::Pending | FwdView::External)
+}
 
 pub enum Action {
     None,
@@ -35,7 +43,7 @@ struct Edit {
 pub struct Ui {
     snap: Vec<HostView>,
     auto: bool,
-    show_system: bool,
+    show_hidden: bool,
     /// Selected app row, tracked by identity so it survives refreshes.
     sel: Option<(String, u16)>,
     editing: Option<Edit>,
@@ -44,11 +52,11 @@ pub struct Ui {
 }
 
 impl Ui {
-    pub fn new(show_system: bool) -> Ui {
+    pub fn new(show_hidden: bool) -> Ui {
         Ui {
             snap: Vec::new(),
             auto: true,
-            show_system,
+            show_hidden,
             sel: None,
             editing: None,
             toast: None,
@@ -72,7 +80,7 @@ impl Ui {
         let mut v = Vec::new();
         for h in &self.snap {
             for a in &h.apps {
-                if self.show_system || !a.system {
+                if row_visible(a, self.show_hidden) {
                     v.push((h.key.clone(), a.rport));
                 }
             }
@@ -219,8 +227,13 @@ impl Ui {
                     let _ = cmds.send(Cmd::ToggleHost { host: h.key.clone() });
                 }
             }
+            (KeyCode::Char('h'), _) => {
+                if let Some((h, a)) = self.selected_app() {
+                    let _ = cmds.send(Cmd::ToggleHidden { host: h.key.clone(), rport: a.rport });
+                }
+            }
             (KeyCode::Char('a'), _) => {
-                self.show_system = !self.show_system;
+                self.show_hidden = !self.show_hidden;
                 self.fix_selection();
             }
             (KeyCode::Char('p'), _) => {
@@ -309,7 +322,7 @@ impl Ui {
         }
 
         // Help
-        let help_text = " ↑↓ select · ⏎/e port · f fwd on/off · F server on/off · c note · o open · a system · p auto · r rescan · q quit";
+        let help_text = " ↑↓ · ⏎/e port · f fwd · F server · h hide/show port · c note · o open · a all ports · p auto · r rescan · q quit";
         f.render_widget(Paragraph::new(Line::from(help_text.dim())), help);
     }
 
@@ -355,7 +368,7 @@ impl Ui {
             let apps: Vec<&AppView> = host
                 .apps
                 .iter()
-                .filter(|a| self.show_system || !a.system)
+                .filter(|a| row_visible(a, self.show_hidden))
                 .collect();
             let hidden = host.apps.len() - apps.len();
 
@@ -365,7 +378,7 @@ impl Ui {
                         let msg = if !host.scanned_once {
                             "   scanning…".to_string()
                         } else if hidden > 0 {
-                            format!("   no apps detected ({hidden} system port{} hidden — press a)",
+                            format!("   no apps detected ({hidden} bg/system port{} hidden — press a)",
                                 if hidden == 1 { "" } else { "s" })
                         } else {
                             "   no listening apps detected".to_string()
@@ -387,9 +400,9 @@ impl Ui {
                             }
                             lines.push(app_line(a, selected));
                         }
-                        if hidden > 0 && !self.show_system {
+                        if hidden > 0 && !self.show_hidden {
                             lines.push(Line::from(
-                                format!("   + {hidden} system port{} hidden (press a)",
+                                format!("   + {hidden} bg/system port{} hidden (press a)",
                                     if hidden == 1 { "" } else { "s" })
                                 .dim(),
                             ));
@@ -459,8 +472,13 @@ fn app_line(a: &AppView, selected: bool) -> Line<'static> {
     if a.pinned {
         tail.push_str("  ⊙ pinned");
     }
-    if a.system {
-        tail.push_str("  [system]");
+    match a.tier {
+        Tier::Bg => tail.push_str("  [bg]"),
+        Tier::System => tail.push_str("  [system]"),
+        Tier::App => {}
+    }
+    if a.overridden {
+        tail.push_str(" ⚑");
     }
 
     let cursor = if selected { " ▸ " } else { "   " };
@@ -477,7 +495,7 @@ fn app_line(a: &AppView, selected: bool) -> Line<'static> {
         }
         spans.push(Span::styled(format!("  ✎ {note}"), Style::new().fg(Color::Cyan)));
     }
-    if a.system && !selected {
+    if a.tier != Tier::App && !selected {
         spans = spans
             .into_iter()
             .map(|s| s.style(Style::new().add_modifier(Modifier::DIM)))

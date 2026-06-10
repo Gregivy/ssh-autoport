@@ -9,6 +9,9 @@ pub enum Cmd {
     Toggle { host: String, rport: u16 },
     /// Attach/replace a user note on a remote app (empty text clears it).
     SetComment { host: String, rport: u16, text: String },
+    /// Hide (demote to background) or unhide (promote to app) a port,
+    /// overriding the heuristic. Persisted.
+    ToggleHidden { host: String, rport: u16 },
     /// Pause/resume forwarding for a whole server.
     ToggleHost { host: String },
     /// Force a rescan of all hosts now.
@@ -47,6 +50,18 @@ pub enum FwdView {
     Error(String),
 }
 
+/// How a remote port is treated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    /// A real app: shown, auto-forwarded.
+    App,
+    /// Background noise (ephemeral/kernel ports): hidden, never
+    /// auto-forwarded, manually forwardable.
+    Bg,
+    /// Infrastructure (sshd, DNS, ...): hidden, never auto-forwarded.
+    System,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppView {
     pub rport: u16,
@@ -56,7 +71,10 @@ pub struct AppView {
     pub pid: Option<u32>,
     pub cmdline: Option<String>,
     pub comment: Option<String>,
-    pub system: bool,
+    /// Effective tier (user override already applied).
+    pub tier: Tier,
+    /// The user pinned this tier by hand (h key).
+    pub overridden: bool,
     pub lport: Option<u16>,
     pub status: FwdView,
     pub pinned: bool,

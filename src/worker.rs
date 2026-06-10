@@ -11,7 +11,7 @@ use crate::discover::{self, LocalConn};
 use crate::ports;
 use crate::remote::{self, RemoteApp};
 use crate::state::State;
-use crate::types::{AppView, Cmd, Ev, FwdView, HostView, MasterView};
+use crate::types::{AppView, Cmd, Ev, FwdView, HostView, MasterView, Tier};
 use crate::util::now_unix;
 
 pub struct Options {
@@ -40,13 +40,35 @@ struct AppW {
     pid: Option<u32>,
     cmdline: Option<String>,
     comment: Option<String>,
-    system: bool,
+    /// Heuristic classification, refreshed every scan.
+    auto_tier: Tier,
+    /// User override: Some(true) = force App, Some(false) = force Bg.
+    override_app: Option<bool>,
     lport: Option<u16>,
     status: FwdView,
     muted: bool,
     pinned: bool,
     /// One automatic retry with a fresh port after a local bind failure.
     retried_new_port: bool,
+}
+
+impl AppW {
+    /// Effective tier with the user's override applied.
+    fn tier(&self) -> Tier {
+        match self.override_app {
+            Some(true) => Tier::App,
+            Some(false) => Tier::Bg,
+            None => self.auto_tier,
+        }
+    }
+}
+
+fn tier_override_from_state(tier: Option<&String>) -> Option<bool> {
+    match tier.map(String::as_str) {
+        Some("app") => Some(true),
+        Some("bg") => Some(false),
+        _ => None,
+    }
 }
 
 struct HostW {
@@ -149,6 +171,7 @@ impl Worker {
             Cmd::Assign { host, rport, lport } => self.assign(host, rport, lport),
             Cmd::Toggle { host, rport } => self.toggle(host, rport),
             Cmd::SetComment { host, rport, text } => self.set_comment(host, rport, text),
+            Cmd::ToggleHidden { host, rport } => self.toggle_hidden(host, rport),
             Cmd::ToggleHost { host } => self.toggle_host(host),
             Cmd::Refresh => {
                 let keys: Vec<String> = self.hosts.keys().cloned().collect();
@@ -384,10 +407,19 @@ impl Worker {
             .collect();
 
         let sshd_port = host.sshd_port;
+        // Cluster context for the Bg heuristic: loopback listeners per name.
+        let mut lo_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for ra in &apps {
+            if ra.addr == "lo" {
+                if let Some(p) = &ra.process {
+                    *lo_counts.entry(p.clone()).or_default() += 1;
+                }
+            }
+        }
         let mut seen: Vec<u16> = Vec::new();
         for ra in apps {
             seen.push(ra.port);
-            let system = remote::is_system(&ra, sshd_port);
+            let auto_tier = remote::classify(&ra, sshd_port, &lo_counts);
             let ext_lport = ext_valid.get(&ra.port).copied();
             match host.apps.get_mut(&ra.port) {
                 Some(app) => {
@@ -401,7 +433,7 @@ impl Worker {
                     if ra.cmdline.is_some() {
                         app.cmdline = ra.cmdline;
                     }
-                    app.system = system;
+                    app.auto_tier = auto_tier;
                     match (&app.status, ext_lport) {
                         // The user's own session forwards this port; ours (if
                         // any) stays untouched, but idle apps adopt theirs.
@@ -434,7 +466,10 @@ impl Worker {
                             pid: ra.pid,
                             cmdline: ra.cmdline,
                             comment: remembered.and_then(|a| a.comment.clone()),
-                            system,
+                            auto_tier,
+                            override_app: tier_override_from_state(
+                                remembered.and_then(|a| a.tier.as_ref()),
+                            ),
                             lport,
                             status,
                             muted: remembered.map(|a| a.muted).unwrap_or(false),
@@ -488,7 +523,7 @@ impl Worker {
         let candidates: Vec<u16> = host
             .apps
             .values()
-            .filter(|a| !a.system && !a.muted && a.status == FwdView::Off)
+            .filter(|a| a.tier() == Tier::App && !a.muted && a.status == FwdView::Off)
             .map(|a| a.rport)
             .collect();
         for rport in candidates {
@@ -562,8 +597,9 @@ impl Worker {
         }
         match result {
             Ok(()) => {
-                if paused || app.muted {
-                    // The user paused/muted while this forward was in flight.
+                if paused || app.muted || app.tier() != Tier::App {
+                    // The user paused/muted/hid this while the forward was in
+                    // flight — undo it.
                     stray_cancel(lport);
                     app.status = FwdView::Off;
                     return;
@@ -651,6 +687,12 @@ impl Worker {
         app.pinned = true;
         app.muted = false;
         app.retried_new_port = false;
+        if app.tier() != Tier::App {
+            // Manually forwarding a hidden port means the user cares about
+            // it: promote it so it stays visible and auto-forwarded.
+            app.override_app = Some(true);
+            self.state.entry(&key, rport).tier = Some("app".into());
+        }
         let wtx = self.wtx.clone();
         std::thread::spawn(move || {
             if let Some(old) = old {
@@ -690,10 +732,61 @@ impl Worker {
                 app.muted = false;
                 app.status = FwdView::Off;
                 app.retried_new_port = false;
+                if app.tier() != Tier::App {
+                    // Manual forward of a hidden port promotes it (see assign).
+                    app.override_app = Some(true);
+                    self.state.entry(&key, rport).tier = Some("app".into());
+                }
                 self.state.entry(&key, rport).muted = false;
                 self.state.save();
                 self.start_forward(&key, rport);
             }
+        }
+    }
+
+    /// Hide a port (stop forwarding, drop from the default view) or restore
+    /// it — the user's answer to both kinds of misclassification. Persisted.
+    fn toggle_hidden(&mut self, key: String, rport: u16) {
+        let Some(host) = self.hosts.get_mut(&key) else { return };
+        let mref = match &host.master {
+            MState::Ready(m) => Some(m.r.clone()),
+            _ => None,
+        };
+        let Some(app) = host.apps.get_mut(&rport) else { return };
+        if app.status == FwdView::External {
+            self.toast(format!(
+                "remote :{rport} is forwarded by your own ssh session — close it there first"
+            ));
+            return;
+        }
+        let label = app.process.clone().unwrap_or_else(|| "?".into());
+        if app.tier() == Tier::App {
+            // demote: cancel our forward, hide from the default view
+            app.override_app = Some(false);
+            if matches!(app.status, FwdView::Active | FwdView::Pending) {
+                if let (Some(m), Some(lp)) = (mref, app.lport) {
+                    std::thread::spawn(move || {
+                        let _ = m.cancel(lp, rport);
+                    });
+                }
+            }
+            app.status = FwdView::Off;
+            self.state.entry(&key, rport).tier = Some("bg".into());
+            self.state.save();
+            self.toast(format!("{label}:{rport} hidden — not forwarded (press a, then h to restore)"));
+        } else {
+            // promote: show it and let auto-forward pick it up
+            app.override_app = Some(true);
+            app.muted = false;
+            if matches!(app.status, FwdView::Error(_)) {
+                app.status = FwdView::Off;
+            }
+            let e = self.state.entry(&key, rport);
+            e.tier = Some("app".into());
+            e.muted = false;
+            self.state.save();
+            self.toast(format!("{label}:{rport} promoted — will be forwarded"));
+            self.auto_forward_pass(&key);
         }
     }
 
@@ -785,7 +878,8 @@ impl Worker {
                         pid: a.pid,
                         cmdline: a.cmdline.clone(),
                         comment: a.comment.clone(),
-                        system: a.system,
+                        tier: a.tier(),
+                        overridden: a.override_app.is_some(),
                         lport: a.lport,
                         status: a.status.clone(),
                         pinned: a.pinned,

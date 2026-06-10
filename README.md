@@ -24,6 +24,14 @@ forwards each one to a local port, and remembers the mapping — so
 
 ## Highlights
 
+- **Signal, not noise.** Listeners in the ephemeral port range (≥ 32768) and
+  clusters of same-named loopback ports — Jupyter kernels, RPC workers, IDE
+  helpers — are classified as *background*: hidden by default and never
+  auto-forwarded, so twenty kernels don't become twenty useless tunnels.
+  Well-known dev ports (3000, 8000, 8080, 8888, …) are never demoted. Press
+  `a` to see everything, `h` to permanently promote/hide any port (the `⚑`
+  marker shows your overrides), and forwarding a hidden port manually
+  promotes it automatically.
 - **Zero server footprint.** Nothing is installed remotely. Scanning runs one
   short-lived `sh` per refresh, using whatever the server already has:
   `ss`, then `netstat`, then raw `/proc/net/tcp` (the same trick VS Code
@@ -75,9 +83,10 @@ ssh-autoport        # in another
 | `Enter` / `e` | type a local port for the app — checks availability, pins it |
 | `f` | toggle forwarding for the selected app (remembered) |
 | `F` | toggle forwarding for the whole server (remembered) |
+| `h` | hide a port (stop forwarding, drop from view) or promote a hidden one (remembered) |
 | `c` | attach a note to the app — shown in the table, remembered |
 | `o` | open `http://127.0.0.1:<port>/` in your browser |
-| `a` | show/hide system ports (sshd, DNS, …) |
+| `a` | show all ports, including background and system ones |
 | `p` | pause/resume auto-forwarding |
 | `r` | rescan now |
 | `q` | quit — cancels our forwards, closes our masters |
