@@ -10,7 +10,7 @@ use crate::control::Master;
 use crate::discover::{self, LocalConn};
 use crate::ports;
 use crate::remote::{self, RemoteApp};
-use crate::state::{Assignment, State};
+use crate::state::State;
 use crate::types::{AppView, Cmd, Ev, FwdView, HostView, MasterView};
 use crate::util::now_unix;
 
@@ -37,7 +37,9 @@ struct AppW {
     rport: u16,
     addr: String,
     process: Option<String>,
-
+    pid: Option<u32>,
+    cmdline: Option<String>,
+    comment: Option<String>,
     system: bool,
     lport: Option<u16>,
     status: FwdView,
@@ -59,6 +61,8 @@ struct HostW {
     ext_forwards: BTreeMap<u16, u16>,
     master: MState,
     connect_inflight: bool,
+    /// User turned forwarding off for this whole server (persisted).
+    paused: bool,
     apps: BTreeMap<u16, AppW>,
     scanning: bool,
     last_scan: Option<Instant>,
@@ -144,6 +148,8 @@ impl Worker {
         match cmd {
             Cmd::Assign { host, rport, lport } => self.assign(host, rport, lport),
             Cmd::Toggle { host, rport } => self.toggle(host, rport),
+            Cmd::SetComment { host, rport, text } => self.set_comment(host, rport, text),
+            Cmd::ToggleHost { host } => self.toggle_host(host),
             Cmd::Refresh => {
                 let keys: Vec<String> = self.hosts.keys().cloned().collect();
                 for k in keys {
@@ -189,6 +195,7 @@ impl Worker {
                     }
                 }
             }
+            let paused = self.state.paused(&key);
             let host = self.hosts.entry(key.clone()).or_insert_with(|| HostW {
                 key: key.clone(),
                 title: format!("{}@{}", r.user, r.hostname),
@@ -199,6 +206,7 @@ impl Worker {
                 ext_forwards: BTreeMap::new(),
                 master: MState::Connecting,
                 connect_inflight: false,
+                paused,
                 apps: BTreeMap::new(),
                 scanning: false,
                 last_scan: None,
@@ -311,7 +319,22 @@ impl Worker {
         let key = key.to_string();
         let wtx = self.wtx.clone();
         std::thread::spawn(move || {
-            let result = mref.scan().map(|out| remote::parse_scan(&out));
+            let result = mref.scan().map(|out| {
+                let mut apps = remote::parse_scan(&out);
+                // Second pass: full command lines for the pids we could see
+                // (only processes owned by the remote user are readable).
+                let pids: Vec<u32> = apps.iter().filter_map(|a| a.pid).collect();
+                if !pids.is_empty() {
+                    if let Ok(map) = mref.cmdlines(&pids) {
+                        for a in &mut apps {
+                            if let Some(c) = a.pid.and_then(|p| map.get(&p)) {
+                                a.cmdline = Some(c.clone());
+                            }
+                        }
+                    }
+                }
+                apps
+            });
             let _ = wtx.send(WMsg::ScanDone { key, result });
         });
     }
@@ -345,17 +368,38 @@ impl Worker {
             }
         };
 
+        // The user's config may *claim* a LocalForward, but the bind can have
+        // silently failed at their ssh's startup (port already taken — e.g.
+        // two servers both wanting :8888, or one of our forwards got there
+        // first). Only trust forwards whose local port is actually held by
+        // something that isn't us; the rest fall through to auto-forwarding
+        // on a free port.
+        let used = self.used_lports();
+        let Some(host) = self.hosts.get_mut(&key) else { return };
+        let ext_valid: BTreeMap<u16, u16> = host
+            .ext_forwards
+            .iter()
+            .filter(|&(_, &lp)| !used.contains(&lp) && !ports::is_free(lp))
+            .map(|(&rp, &lp)| (rp, lp))
+            .collect();
+
         let sshd_port = host.sshd_port;
         let mut seen: Vec<u16> = Vec::new();
         for ra in apps {
             seen.push(ra.port);
             let system = remote::is_system(&ra, sshd_port);
-            let ext_lport = host.ext_forwards.get(&ra.port).copied();
+            let ext_lport = ext_valid.get(&ra.port).copied();
             match host.apps.get_mut(&ra.port) {
                 Some(app) => {
                     app.addr = ra.addr;
                     if ra.process.is_some() {
                         app.process = ra.process;
+                    }
+                    if ra.pid.is_some() {
+                        app.pid = ra.pid;
+                    }
+                    if ra.cmdline.is_some() {
+                        app.cmdline = ra.cmdline;
                     }
                     app.system = system;
                     match (&app.status, ext_lport) {
@@ -387,10 +431,13 @@ impl Worker {
                             rport: ra.port,
                             addr: ra.addr,
                             process: ra.process,
+                            pid: ra.pid,
+                            cmdline: ra.cmdline,
+                            comment: remembered.and_then(|a| a.comment.clone()),
                             system,
                             lport,
                             status,
-                            muted: false,
+                            muted: remembered.map(|a| a.muted).unwrap_or(false),
                             pinned: remembered.map(|a| a.pinned).unwrap_or(false),
                             retried_new_port: false,
                         },
@@ -435,7 +482,7 @@ impl Worker {
             return;
         }
         let Some(host) = self.hosts.get(key) else { return };
-        if !matches!(host.master, MState::Ready(_)) {
+        if host.paused || !matches!(host.master, MState::Ready(_)) {
             return;
         }
         let candidates: Vec<u16> = host
@@ -462,8 +509,8 @@ impl Worker {
         if let Some(lp) = app.lport {
             prefs.push(lp);
         }
-        if let Some(a) = self.state.get(key, rport) {
-            prefs.push(a.local_port);
+        if let Some(lp) = self.state.get(key, rport).and_then(|a| a.local_port) {
+            prefs.push(lp);
         }
         prefs.push(rport);
         let Some(lport) = ports::find_free(&prefs, &taken) else {
@@ -487,43 +534,50 @@ impl Worker {
             .app_mut(&key, rport)
             .and_then(|a| a.process.clone());
         let Some(host) = self.hosts.get_mut(&key) else { return };
-        let stray_cancel = |host: &HostW, lp: u16| {
-            if let MState::Ready(m) = &host.master {
-                let mref = m.r.clone();
+        let paused = host.paused;
+        let mref = match &host.master {
+            MState::Ready(m) => Some(m.r.clone()),
+            _ => None,
+        };
+        let stray_cancel = |lp: u16| {
+            if let Some(m) = mref.clone() {
                 std::thread::spawn(move || {
-                    let _ = mref.cancel(lp, rport);
+                    let _ = m.cancel(lp, rport);
                 });
             }
         };
         let Some(app) = host.apps.get_mut(&rport) else {
             // App vanished while the forward was in flight.
             if result.is_ok() {
-                stray_cancel(host, lport);
+                stray_cancel(lport);
             }
             return;
         };
         if app.lport != Some(lport) {
             // A newer assignment superseded this one.
             if result.is_ok() {
-                stray_cancel(host, lport);
+                stray_cancel(lport);
             }
             return;
         }
         match result {
             Ok(()) => {
+                if paused || app.muted {
+                    // The user paused/muted while this forward was in flight.
+                    stray_cancel(lport);
+                    app.status = FwdView::Off;
+                    return;
+                }
                 app.status = FwdView::Active;
                 app.retried_new_port = false;
                 app.pinned = pin;
-                self.state.set(
-                    &key,
-                    rport,
-                    Assignment {
-                        local_port: lport,
-                        process,
-                        pinned: pin,
-                        updated_at: now_unix(),
-                    },
-                );
+                let e = self.state.entry(&key, rport);
+                e.local_port = Some(lport);
+                e.process = process;
+                e.pinned = pin;
+                e.muted = false;
+                e.updated_at = now_unix();
+                self.state.save();
             }
             Err(e) => {
                 let bindish = e.contains("bind") || e.contains("address") || e.contains("listen");
@@ -561,16 +615,13 @@ impl Worker {
         }
         if app.status == FwdView::Active && app.lport == Some(lport) {
             app.pinned = true;
-            self.state.set(
-                &key,
-                rport,
-                Assignment {
-                    local_port: lport,
-                    process: app.process.clone(),
-                    pinned: true,
-                    updated_at: now_unix(),
-                },
-            );
+            let process = app.process.clone();
+            let e = self.state.entry(&key, rport);
+            e.local_port = Some(lport);
+            e.process = process;
+            e.pinned = true;
+            e.updated_at = now_unix();
+            self.state.save();
             self.toast(format!("port {lport} pinned"));
             return;
         }
@@ -632,13 +683,65 @@ impl Worker {
                         let _ = mref.cancel(lport, rport);
                     });
                 }
+                self.state.entry(&key, rport).muted = true;
+                self.state.save();
             }
             FwdView::Off | FwdView::Error(_) => {
                 app.muted = false;
                 app.status = FwdView::Off;
                 app.retried_new_port = false;
+                self.state.entry(&key, rport).muted = false;
+                self.state.save();
                 self.start_forward(&key, rport);
             }
+        }
+    }
+
+    fn set_comment(&mut self, key: String, rport: u16, text: String) {
+        let text = text.trim().to_string();
+        let comment = if text.is_empty() { None } else { Some(text) };
+        let Some(app) = self.app_mut(&key, rport) else { return };
+        app.comment = comment.clone();
+        let saved = comment.is_some();
+        self.state.entry(&key, rport).comment = comment;
+        self.state.save();
+        self.toast(if saved { "note saved".into() } else { "note cleared".into() });
+    }
+
+    /// Pause/resume forwarding for a whole server (persisted).
+    fn toggle_host(&mut self, key: String) {
+        let Some(host) = self.hosts.get_mut(&key) else { return };
+        host.paused = !host.paused;
+        let paused = host.paused;
+        let mref = match &host.master {
+            MState::Ready(m) => Some(m.r.clone()),
+            _ => None,
+        };
+        if paused {
+            let mut cancels: Vec<(u16, u16)> = Vec::new();
+            for app in host.apps.values_mut() {
+                if matches!(app.status, FwdView::Active | FwdView::Pending) {
+                    if let Some(lp) = app.lport {
+                        cancels.push((lp, app.rport));
+                    }
+                    app.status = FwdView::Off;
+                }
+            }
+            if let (Some(m), false) = (mref, cancels.is_empty()) {
+                std::thread::spawn(move || {
+                    for (lp, rp) in cancels {
+                        let _ = m.cancel(lp, rp);
+                    }
+                });
+            }
+        }
+        self.state.set_paused(&key, paused);
+        let title = self.hosts.get(&key).map(|h| h.title.clone()).unwrap_or(key.clone());
+        if paused {
+            self.toast(format!("{title}: forwarding paused"));
+        } else {
+            self.toast(format!("{title}: forwarding resumed"));
+            self.auto_forward_pass(&key);
         }
     }
 
@@ -669,6 +772,7 @@ impl Worker {
                     MState::Ready(m) => MasterView::Ready { shared: m.external },
                     MState::Failed { err, .. } => MasterView::Failed(err.clone()),
                 },
+                paused: h.paused,
                 scan_err: h.scan_err.clone(),
                 scanned_once: h.last_scan.is_some(),
                 apps: h
@@ -678,6 +782,9 @@ impl Worker {
                         rport: a.rport,
                         addr: a.addr.clone(),
                         process: a.process.clone(),
+                        pid: a.pid,
+                        cmdline: a.cmdline.clone(),
+                        comment: a.comment.clone(),
                         system: a.system,
                         lport: a.lport,
                         status: a.status.clone(),

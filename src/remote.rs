@@ -9,13 +9,15 @@ use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// A TCP listener found on the remote host.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RemoteApp {
     pub port: u16,
     /// Normalized bind address: "lo" (loopback), "*" (all), or literal.
     pub addr: String,
     pub process: Option<String>,
     pub pid: Option<u32>,
+    /// Full command line, fetched in a second pass for owned processes.
+    pub cmdline: Option<String>,
 }
 
 /// Fed to `sh` on the remote via stdin: `ssh <dest> -- sh`.
@@ -96,7 +98,7 @@ pub fn parse_scan(out: &str) -> Vec<RemoteApp> {
             Some((pid, _)) => (Some(*pid), None),
             None => (None, None),
         };
-        listeners.push(RemoteApp { port, addr, process, pid });
+        listeners.push(RemoteApp { port, addr, process, pid, ..Default::default() });
     }
 
     dedupe(listeners)
@@ -133,7 +135,7 @@ fn parse_ss_line(line: &str) -> Option<RemoteApp> {
     }
     let (addr, port) = split_addr_port(fields[3])?;
     let (process, pid) = parse_ss_process(line);
-    Some(RemoteApp { port, addr, process, pid })
+    Some(RemoteApp { port, addr, process, pid, ..Default::default() })
 }
 
 fn parse_ss_process(line: &str) -> (Option<String>, Option<u32>) {
@@ -165,7 +167,7 @@ fn parse_netstat_line(line: &str) -> Option<RemoteApp> {
             }
         }
     }
-    Some(RemoteApp { port, addr, process, pid })
+    Some(RemoteApp { port, addr, process, pid, ..Default::default() })
 }
 
 /// `0: 0100007F:0BB8 00000000:0000 0A ... uid timeout inode ...`
@@ -278,7 +280,7 @@ mod tests {
             LISTEN 0      128          0.0.0.0:22        0.0.0.0:*\n";
         let apps = parse_scan(out);
         assert_eq!(apps.len(), 3);
-        assert_eq!(apps[0], RemoteApp { port: 22, addr: "*".into(), process: None, pid: None });
+        assert_eq!(apps[0], RemoteApp { port: 22, addr: "*".into(), process: None, pid: None, ..Default::default() });
         assert_eq!(apps[1].process.as_deref(), Some("node"));
         assert_eq!(apps[1].addr, "lo");
         assert_eq!(apps[2].port, 8000);
@@ -315,9 +317,9 @@ mod tests {
             8888 4300 my web app\n";
         let apps = parse_scan(out);
         assert_eq!(apps.len(), 3); // established socket excluded
-        assert_eq!(apps[0], RemoteApp { port: 3000, addr: "lo".into(), process: Some("node".into()), pid: Some(4242) });
-        assert_eq!(apps[1], RemoteApp { port: 4000, addr: "lo".into(), process: Some("my web app".into()), pid: Some(4300) });
-        assert_eq!(apps[2], RemoteApp { port: 8080, addr: "*".into(), process: None, pid: None });
+        assert_eq!(apps[0], RemoteApp { port: 3000, addr: "lo".into(), process: Some("node".into()), pid: Some(4242), ..Default::default() });
+        assert_eq!(apps[1], RemoteApp { port: 4000, addr: "lo".into(), process: Some("my web app".into()), pid: Some(4300), ..Default::default() });
+        assert_eq!(apps[2], RemoteApp { port: 8080, addr: "*".into(), process: None, pid: None, ..Default::default() });
     }
 
     #[test]
@@ -332,11 +334,11 @@ mod tests {
 
     #[test]
     fn system_filter() {
-        let sshd = RemoteApp { port: 2222, addr: "*".into(), process: Some("sshd".into()), pid: None };
+        let sshd = RemoteApp { port: 2222, addr: "*".into(), process: Some("sshd".into()), pid: None, ..Default::default() };
         assert!(is_system(&sshd, 2222));
-        let app = RemoteApp { port: 3000, addr: "lo".into(), process: Some("node".into()), pid: None };
+        let app = RemoteApp { port: 3000, addr: "lo".into(), process: Some("node".into()), pid: None, ..Default::default() };
         assert!(!is_system(&app, 22));
-        let dns = RemoteApp { port: 53, addr: "lo".into(), process: None, pid: None };
+        let dns = RemoteApp { port: 53, addr: "lo".into(), process: None, pid: None, ..Default::default() };
         assert!(is_system(&dns, 22));
     }
 }

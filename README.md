@@ -31,9 +31,16 @@ forwards each one to a local port, and remembers the mapping — so
 - **Watches your connections.** Polls the local process table for `ssh`
   sessions; new connections appear in the table automatically, closed ones are
   torn down (with their forwards).
-- **Persistent port memory.** Each `server + remote port` pair keeps its local
-  port across restarts (`~/.config/ssh-autoport/state.json`). If a remembered
-  port happens to be taken, a new one is chosen automatically — and remembered.
+- **Persistent memory.** Each `server + remote port` pair keeps its local
+  port, on/off state, and your notes across restarts
+  (`~/.config/ssh-autoport/state.json`); per-server pauses are remembered too.
+  If a remembered port happens to be taken, a new one is chosen automatically —
+  and remembered.
+- **Correct under port collisions.** Two servers both running an app on
+  `:8888`? Whoever gets local 8888 first keeps it; the other app is forwarded
+  on the next free port. Config `LocalForward`s that silently failed to bind
+  (their port was taken when your ssh started) are detected and taken over
+  instead of being trusted blindly.
 - **Manual control.** Assign any local port yourself in the TUI (this *pins*
   it). If the port can't be used you're told exactly why, e.g.
   `can't use 8123: used by "python3"`.
@@ -66,12 +73,18 @@ ssh-autoport        # in another
 | --- | --- |
 | `↑` `↓` / `j` `k` | select an app |
 | `Enter` / `e` | type a local port for the app — checks availability, pins it |
-| `f` | toggle forwarding for the selected app |
+| `f` | toggle forwarding for the selected app (remembered) |
+| `F` | toggle forwarding for the whole server (remembered) |
+| `c` | attach a note to the app — shown in the table, remembered |
 | `o` | open `http://127.0.0.1:<port>/` in your browser |
 | `a` | show/hide system ports (sshd, DNS, …) |
 | `p` | pause/resume auto-forwarding |
 | `r` | rescan now |
 | `q` | quit — cancels our forwards, closes our masters |
+
+The detail panel under the table shows the selected app's pid and full
+command line (fetched from `/proc/<pid>/cmdline`, so twenty `python`
+processes stop looking identical), plus your note.
 
 Options: `--interval <secs>` rescan cadence (default 3), `--no-auto` manual
 mode, `--show-system` show infrastructure ports at start.

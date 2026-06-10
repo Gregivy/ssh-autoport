@@ -18,7 +18,14 @@ pub enum Action {
     Quit,
 }
 
+#[derive(PartialEq)]
+enum EditKind {
+    Port,
+    Comment,
+}
+
 struct Edit {
+    kind: EditKind,
     host: String,
     rport: u16,
     label: String,
@@ -116,24 +123,44 @@ impl Ui {
                 KeyCode::Backspace => {
                     edit.buf.pop();
                 }
-                KeyCode::Char(c) if c.is_ascii_digit() && edit.buf.len() < 5 => {
+                KeyCode::Char(c)
+                    if edit.kind == EditKind::Port
+                        && c.is_ascii_digit()
+                        && edit.buf.len() < 5 =>
+                {
+                    edit.buf.push(c);
+                }
+                KeyCode::Char(c)
+                    if edit.kind == EditKind::Comment
+                        && !c.is_control()
+                        && edit.buf.len() < 120 =>
+                {
                     edit.buf.push(c);
                 }
                 KeyCode::Enter => {
                     let edit = self.editing.take().unwrap();
-                    match edit.buf.parse::<u16>() {
-                        Ok(p) if p >= 1 => {
-                            let _ = cmds.send(Cmd::Assign {
+                    match edit.kind {
+                        EditKind::Port => match edit.buf.parse::<u16>() {
+                            Ok(p) if p >= 1 => {
+                                let _ = cmds.send(Cmd::Assign {
+                                    host: edit.host,
+                                    rport: edit.rport,
+                                    lport: p,
+                                });
+                            }
+                            _ => {
+                                self.toast = Some((
+                                    format!("\"{}\" is not a valid port (1-65535)", edit.buf),
+                                    Instant::now(),
+                                ));
+                            }
+                        },
+                        EditKind::Comment => {
+                            let _ = cmds.send(Cmd::SetComment {
                                 host: edit.host,
                                 rport: edit.rport,
-                                lport: p,
+                                text: edit.buf,
                             });
-                        }
-                        _ => {
-                            self.toast = Some((
-                                format!("\"{}\" is not a valid port (1-65535)", edit.buf),
-                                Instant::now(),
-                            ));
                         }
                     }
                 }
@@ -151,10 +178,11 @@ impl Ui {
             (KeyCode::Enter, _) | (KeyCode::Char('e'), _) => {
                 if let Some((h, a)) = self.selected_app() {
                     self.editing = Some(Edit {
+                        kind: EditKind::Port,
                         host: h.key.clone(),
                         rport: a.rport,
                         label: format!(
-                            "{} (remote :{}) on {}",
+                            "local port for {} (remote :{}) on {}",
                             a.process.as_deref().unwrap_or("?"),
                             a.rport,
                             h.title
@@ -163,9 +191,32 @@ impl Ui {
                     });
                 }
             }
+            (KeyCode::Char('c'), _) => {
+                if let Some((h, a)) = self.selected_app() {
+                    self.editing = Some(Edit {
+                        kind: EditKind::Comment,
+                        host: h.key.clone(),
+                        rport: a.rport,
+                        label: format!(
+                            "note for {} (remote :{}) on {}",
+                            a.process.as_deref().unwrap_or("?"),
+                            a.rport,
+                            h.title
+                        ),
+                        buf: a.comment.clone().unwrap_or_default(),
+                    });
+                }
+            }
             (KeyCode::Char('f'), _) => {
                 if let Some((h, a)) = self.selected_app() {
                     let _ = cmds.send(Cmd::Toggle { host: h.key.clone(), rport: a.rport });
+                }
+            }
+            (KeyCode::Char('F'), _) => {
+                if let Some((h, _)) = self.selected_app() {
+                    let _ = cmds.send(Cmd::ToggleHost { host: h.key.clone() });
+                } else if let Some(h) = self.snap.first() {
+                    let _ = cmds.send(Cmd::ToggleHost { host: h.key.clone() });
                 }
             }
             (KeyCode::Char('a'), _) => {
@@ -194,9 +245,10 @@ impl Ui {
     }
 
     pub fn draw(&mut self, f: &mut Frame) {
-        let [head, body, note, help] = Layout::vertical([
+        let [head, body, detail, note, help] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
+            Constraint::Length(2),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
@@ -231,6 +283,9 @@ impl Ui {
         self.scroll = self.scroll.min(lines.len().saturating_sub(1) as u16);
         f.render_widget(Paragraph::new(lines).scroll((self.scroll, 0)), body);
 
+        // Detail panel for the selected app
+        f.render_widget(Paragraph::new(self.detail_lines()), detail);
+
         // Toast / edit prompt
         if let Some(edit) = &self.editing {
             let l = Line::from(vec![
@@ -254,8 +309,29 @@ impl Ui {
         }
 
         // Help
-        let help_text = " ↑↓ select · ⏎/e set port · f forward on/off · o open · a system ports · p auto · r refresh · q quit";
+        let help_text = " ↑↓ select · ⏎/e port · f fwd on/off · F server on/off · c note · o open · a system · p auto · r rescan · q quit";
         f.render_widget(Paragraph::new(Line::from(help_text.dim())), help);
+    }
+
+    /// Two lines describing the selected app: command line + note.
+    fn detail_lines(&self) -> Vec<Line<'static>> {
+        let Some((_, a)) = self.selected_app() else {
+            return vec![Line::from(""), Line::from("")];
+        };
+        let l1 = match (a.pid, &a.cmdline, &a.process) {
+            (Some(pid), Some(cmd), _) => {
+                Line::from(format!(" ▪ pid {pid} · {cmd}").dim())
+            }
+            (Some(pid), None, Some(p)) => Line::from(format!(" ▪ pid {pid} · {p}").dim()),
+            _ => Line::from(
+                " ▪ process details unavailable (owned by another user on the server)".dim(),
+            ),
+        };
+        let l2 = match &a.comment {
+            Some(c) => Line::from(vec![" ✎ ".cyan(), c.clone().cyan()]),
+            None => Line::from(" ✎ no note — press c to add one".dim()),
+        };
+        vec![l1, l2]
     }
 
     /// Render all host blocks; returns lines plus the selected row's index.
@@ -336,8 +412,15 @@ fn host_line(host: &HostView) -> Line<'static> {
             spans.push("  connecting…".yellow());
         }
         MasterView::Ready { shared } => {
-            spans.push("● ".green());
+            if host.paused {
+                spans.push("⏸ ".yellow());
+            } else {
+                spans.push("● ".green());
+            }
             spans.push(host.title.clone().bold());
+            if host.paused {
+                spans.push("  forwarding paused (F to resume)".yellow());
+            }
             if *shared {
                 spans.push("  (sharing your ssh session)".dim());
             }
@@ -385,8 +468,15 @@ fn app_line(a: &AppView, selected: bool) -> Line<'static> {
     let mut spans: Vec<Span> = vec![
         Span::raw(base),
         Span::styled(format!("{mark} "), Style::new().fg(color)),
-        Span::styled(tail, Style::new().fg(color)),
+        Span::styled(format!("{tail:<14}"), Style::new().fg(color)),
     ];
+    if let Some(note) = &a.comment {
+        let mut note = note.clone();
+        if note.chars().count() > 28 {
+            note = format!("{}…", note.chars().take(27).collect::<String>());
+        }
+        spans.push(Span::styled(format!("  ✎ {note}"), Style::new().fg(Color::Cyan)));
+    }
     if a.system && !selected {
         spans = spans
             .into_iter()

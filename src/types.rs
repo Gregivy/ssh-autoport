@@ -7,6 +7,10 @@ pub enum Cmd {
     Assign { host: String, rport: u16, lport: u16 },
     /// Toggle forwarding on/off for a remote app.
     Toggle { host: String, rport: u16 },
+    /// Attach/replace a user note on a remote app (empty text clears it).
+    SetComment { host: String, rport: u16, text: String },
+    /// Pause/resume forwarding for a whole server.
+    ToggleHost { host: String },
     /// Force a rescan of all hosts now.
     Refresh,
     /// Toggle global auto-forwarding.
@@ -49,6 +53,9 @@ pub struct AppView {
     /// Normalized remote bind address: "lo", "*", or a literal address.
     pub addr: String,
     pub process: Option<String>,
+    pub pid: Option<u32>,
+    pub cmdline: Option<String>,
+    pub comment: Option<String>,
     pub system: bool,
     pub lport: Option<u16>,
     pub status: FwdView,
@@ -65,6 +72,7 @@ pub struct HostView {
     /// The destination as the user typed it (config alias etc.), if different.
     pub alias: Option<String>,
     pub master: MasterView,
+    pub paused: bool,
     pub scan_err: Option<String>,
     pub scanned_once: bool,
     pub apps: Vec<AppView>,

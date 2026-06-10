@@ -52,12 +52,13 @@ OPTIONS:
 
 KEYS (in the TUI):
     Up/Down    select app          Enter/e   assign a local port (pins it)
-    f          forward on/off      o         open http://127.0.0.1:<port>/
+    f          forward on/off      F         whole-server forwarding on/off
+    c          attach a note       o         open http://127.0.0.1:<port>/
     a          show/hide system ports        p   pause/resume auto-forward
     r          rescan now          q         quit (tears down our forwards)
 
-Port assignments are remembered per server+app in
-~/.config/ssh-autoport/state.json and reused next time.";
+Port assignments, on/off states, notes and server pauses are remembered
+per server+app in ~/.config/ssh-autoport/state.json.";
 
 fn main() {
     let mut interval = Duration::from_secs(3);

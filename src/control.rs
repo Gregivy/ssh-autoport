@@ -75,6 +75,38 @@ impl MasterRef {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
+    /// Fetch full command lines for the given remote pids (best effort —
+    /// only readable for processes the remote user owns, Linux only).
+    pub fn cmdlines(
+        &self,
+        pids: &[u32],
+    ) -> Result<std::collections::HashMap<u32, String>, String> {
+        let list = pids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let script = format!(
+            "for p in {list}; do if [ -r /proc/$p/cmdline ]; then printf '%s ' \"$p\"; tr '\\0' ' ' < /proc/$p/cmdline; echo; fi; done\n"
+        );
+        let mut c = self.base();
+        c.arg("-T");
+        c.arg(&self.dest).arg("--").arg("sh");
+        let out = output_timeout(c, Duration::from_secs(15), Some(&script))?;
+        let mut map = std::collections::HashMap::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some((pid, cmd)) = line.split_once(' ') {
+                if let Ok(pid) = pid.parse::<u32>() {
+                    let cmd = cmd.trim();
+                    if !cmd.is_empty() {
+                        map.insert(pid, cmd.to_string());
+                    }
+                }
+            }
+        }
+        Ok(map)
+    }
+
     pub fn forward(&self, lport: u16, rport: u16) -> Result<(), String> {
         self.mux_forward("forward", lport, rport)
     }
