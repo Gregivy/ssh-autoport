@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.svg" alt="ssh-autoport logo" width="200">
+</p>
+
 # ssh-autoport
 
 Auto-discover and port-forward apps running on your active SSH connections — with a rich TUI.
